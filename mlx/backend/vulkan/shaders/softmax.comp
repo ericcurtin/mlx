@@ -11,25 +11,37 @@ layout(push_constant) uniform PushConstants {
     uint seq_len;
 } params;
 
-shared float shared_max;
-shared float shared_sum;
+shared float shared_max[256];
+shared float shared_sum[256];
 
 void main() {
     uint batch = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
     uint offset = batch * params.seq_len;
     
-    // Step 1: Find max value
+    // Initialize shared memory
+    shared_max[tid] = -1e38;
+    shared_sum[tid] = 0.0;
+    barrier();
+    
+    // Step 1: Find max value - each thread processes multiple elements
     float local_max = -1e38;
     for (uint i = tid; i < params.seq_len; i += gl_WorkGroupSize.x) {
         local_max = max(local_max, in_data[offset + i]);
     }
-    
-    // Reduce max within workgroup
-    atomicMax(shared_max, local_max);
+    shared_max[tid] = local_max;
     barrier();
     
-    float max_val = shared_max;
+    // Reduce max within workgroup
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
+        }
+        barrier();
+    }
+    
+    float max_val = shared_max[0];
+    barrier();
     
     // Step 2: Compute exp and sum
     float local_sum = 0.0;
@@ -38,12 +50,19 @@ void main() {
         out_data[offset + i] = exp_val;
         local_sum += exp_val;
     }
-    
-    // Reduce sum within workgroup
-    atomicAdd(shared_sum, local_sum);
+    shared_sum[tid] = local_sum;
     barrier();
     
-    float sum_val = shared_sum;
+    // Reduce sum within workgroup
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        barrier();
+    }
+    
+    float sum_val = shared_sum[0];
+    barrier();
     
     // Step 3: Normalize
     for (uint i = tid; i < params.seq_len; i += gl_WorkGroupSize.x) {

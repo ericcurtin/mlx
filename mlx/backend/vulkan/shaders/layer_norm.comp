@@ -17,23 +17,36 @@ layout(push_constant) uniform PushConstants {
     float eps;
 } params;
 
-shared float shared_sum;
-shared float shared_sq_sum;
+shared float shared_sum[256];
+shared float shared_sq_sum[256];
 
 void main() {
     uint batch = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
     uint offset = batch * params.hidden_size;
     
-    // Step 1: Compute mean
+    // Initialize shared memory
+    shared_sum[tid] = 0.0;
+    shared_sq_sum[tid] = 0.0;
+    barrier();
+    
+    // Step 1: Compute sum for mean
     float local_sum = 0.0;
     for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {
         local_sum += in_data[offset + i];
     }
-    atomicAdd(shared_sum, local_sum);
+    shared_sum[tid] = local_sum;
     barrier();
     
-    float mean = shared_sum / float(params.hidden_size);
+    // Reduce sum
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        barrier();
+    }
+    
+    float mean = shared_sum[0] / float(params.hidden_size);
     barrier();
     
     // Step 2: Compute variance
@@ -42,11 +55,20 @@ void main() {
         float diff = in_data[offset + i] - mean;
         local_sq_sum += diff * diff;
     }
-    atomicAdd(shared_sq_sum, local_sq_sum);
+    shared_sq_sum[tid] = local_sq_sum;
     barrier();
     
-    float variance = shared_sq_sum / float(params.hidden_size);
+    // Reduce variance
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sq_sum[tid] += shared_sq_sum[tid + s];
+        }
+        barrier();
+    }
+    
+    float variance = shared_sq_sum[0] / float(params.hidden_size);
     float inv_std = 1.0 / sqrt(variance + params.eps);
+    barrier();
     
     // Step 3: Normalize
     for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {

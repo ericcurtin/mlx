@@ -41,11 +41,11 @@ class VulkanAllocator : public allocator::Allocator {
   VulkanAllocator();
   friend VulkanAllocator& allocator();
 
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   size_t memory_limit_;
   size_t active_memory_{0};
   size_t peak_memory_{0};
-  BufferCache<VulkanBuffer> buffer_cache_;
+  mutable BufferCache<VulkanBuffer> buffer_cache_;
 };
 
 VulkanAllocator& allocator();

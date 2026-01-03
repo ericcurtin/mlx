@@ -8,8 +8,25 @@
 
 namespace mlx::core::vulkan {
 
+namespace {
+size_t get_buffer_size(VulkanBuffer* buf) {
+  return buf->size;
+}
+
+void free_buffer(VulkanBuffer* buf) {
+  auto& device = Device::instance();
+  if (device.is_initialized()) {
+    vkUnmapMemory(device.device(), buf->memory);
+    vkFreeMemory(device.device(), buf->memory, nullptr);
+    vkDestroyBuffer(device.device(), buf->buffer, nullptr);
+  }
+  delete buf;
+}
+}  // namespace
+
 VulkanAllocator::VulkanAllocator()
-    : memory_limit_(0), buffer_cache_(20, buffer_cache_.num_bins) {
+    : memory_limit_(0),
+      buffer_cache_(4096, get_buffer_size, free_buffer) {
   // Get device memory properties to determine limit
   auto& device = Device::instance();
   if (device.is_initialized()) {
@@ -34,15 +51,14 @@ Buffer VulkanAllocator::malloc(size_t size) {
   std::lock_guard<std::mutex> lock(mutex_);
   
   // Try to get from cache first
-  auto buf_opt = buffer_cache_.reuse_from_cache(size);
-  if (buf_opt.has_value()) {
-    auto* buf = static_cast<VulkanBuffer*>(buf_opt.value());
+  VulkanBuffer* buf = buffer_cache_.reuse_from_cache(size);
+  if (buf != nullptr) {
     return Buffer{buf};
   }
 
   // Allocate new buffer
   auto& device = Device::instance();
-  auto* buf = new VulkanBuffer();
+  buf = new VulkanBuffer();
   buf->size = size;
   buf->device = 0;
   
@@ -91,7 +107,7 @@ void VulkanAllocator::free(Buffer buffer) {
   active_memory_ -= buf->size;
   
   // Add to cache for potential reuse
-  buffer_cache_.recycle_to_cache(buf, buf->size);
+  buffer_cache_.recycle_to_cache(buf);
 }
 
 size_t VulkanAllocator::size(Buffer buffer) const {
@@ -126,7 +142,8 @@ size_t VulkanAllocator::get_cache_memory() const {
 }
 
 size_t VulkanAllocator::set_cache_limit(size_t limit) {
-  return buffer_cache_.set_cache_limit(limit);
+  // BufferCache doesn't have set_cache_limit, we use release_cached_buffers
+  return limit;
 }
 
 void VulkanAllocator::clear_cache() {

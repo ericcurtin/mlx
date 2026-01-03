@@ -16,24 +16,37 @@ layout(push_constant) uniform PushConstants {
     float eps;
 } params;
 
-shared float shared_sq_sum;
+shared float shared_sq_sum[256];
 
 void main() {
     uint batch = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
     uint offset = batch * params.hidden_size;
     
-    // Compute mean of squares
+    // Initialize shared memory
+    shared_sq_sum[tid] = 0.0;
+    barrier();
+    
+    // Compute sum of squares
     float local_sq_sum = 0.0;
     for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {
         float val = in_data[offset + i];
         local_sq_sum += val * val;
     }
-    atomicAdd(shared_sq_sum, local_sq_sum);
+    shared_sq_sum[tid] = local_sq_sum;
     barrier();
     
-    float rms = sqrt(shared_sq_sum / float(params.hidden_size) + params.eps);
+    // Reduce sum
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sq_sum[tid] += shared_sq_sum[tid + s];
+        }
+        barrier();
+    }
+    
+    float rms = sqrt(shared_sq_sum[0] / float(params.hidden_size) + params.eps);
     float inv_rms = 1.0 / rms;
+    barrier();
     
     // Normalize
     for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {
