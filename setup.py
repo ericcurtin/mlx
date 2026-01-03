@@ -55,6 +55,7 @@ def get_version():
 build_stage = int(os.environ.get("MLX_BUILD_STAGE", 0))
 build_macos = platform.system() == "Darwin"
 build_cuda = "MLX_BUILD_CUDA=ON" in os.environ.get("CMAKE_ARGS", "")
+build_vulkan = "MLX_BUILD_VULKAN=ON" in os.environ.get("CMAKE_ARGS", "")
 
 
 # A CMakeExtension needs a sourcedir instead of a file list.
@@ -274,6 +275,7 @@ if __name__ == "__main__":
                     f'mlx-cuda-{toolkit}=={version}; platform_system == "Linux"'
                 ]
             extras["cpu"] = [f'mlx-cpu=={version}; platform_system == "Linux"']
+            extras["vulkan"] = [f'mlx-vulkan=={version}; platform_system == "Linux"']
 
         _setup(
             name="mlx",
@@ -309,6 +311,8 @@ if __name__ == "__main__":
                 f"nvidia-nccl-cu{toolkit}",
             ]
 
+        elif build_vulkan:
+            name = "mlx-vulkan"
         else:
             name = "mlx-cpu"
         _setup(
