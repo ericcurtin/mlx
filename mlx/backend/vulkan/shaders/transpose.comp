@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// Transpose shader for 2D matrices
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float in_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+} params;
+
+shared float tile[16][17];  // +1 to avoid bank conflicts
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint local_x = gl_LocalInvocationID.x;
+    uint local_y = gl_LocalInvocationID.y;
+    
+    // Load tile into shared memory
+    if (x < params.cols && y < params.rows) {
+        tile[local_y][local_x] = in_data[y * params.cols + x];
+    }
+    
+    barrier();
+    
+    // Compute transposed position
+    uint new_x = gl_WorkGroupID.y * 16 + local_x;
+    uint new_y = gl_WorkGroupID.x * 16 + local_y;
+    
+    // Write transposed tile
+    if (new_x < params.rows && new_y < params.cols) {
+        out_data[new_y * params.rows + new_x] = tile[local_x][local_y];
+    }
+}

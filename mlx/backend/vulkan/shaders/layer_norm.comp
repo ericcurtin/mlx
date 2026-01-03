@@ -1,0 +1,56 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// Layer normalization shader
+// output = (x - mean) / sqrt(var + eps) * weight + bias
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float in_data[]; };
+layout(set = 0, binding = 1) readonly buffer Weight { float weight[]; };
+layout(set = 0, binding = 2) readonly buffer Bias { float bias[]; };
+layout(set = 0, binding = 3) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint hidden_size;
+    float eps;
+} params;
+
+shared float shared_sum;
+shared float shared_sq_sum;
+
+void main() {
+    uint batch = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint offset = batch * params.hidden_size;
+    
+    // Step 1: Compute mean
+    float local_sum = 0.0;
+    for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {
+        local_sum += in_data[offset + i];
+    }
+    atomicAdd(shared_sum, local_sum);
+    barrier();
+    
+    float mean = shared_sum / float(params.hidden_size);
+    barrier();
+    
+    // Step 2: Compute variance
+    float local_sq_sum = 0.0;
+    for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {
+        float diff = in_data[offset + i] - mean;
+        local_sq_sum += diff * diff;
+    }
+    atomicAdd(shared_sq_sum, local_sq_sum);
+    barrier();
+    
+    float variance = shared_sq_sum / float(params.hidden_size);
+    float inv_std = 1.0 / sqrt(variance + params.eps);
+    
+    // Step 3: Normalize
+    for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {
+        float normalized = (in_data[offset + i] - mean) * inv_std;
+        out_data[offset + i] = normalized * weight[i] + bias[i];
+    }
+}

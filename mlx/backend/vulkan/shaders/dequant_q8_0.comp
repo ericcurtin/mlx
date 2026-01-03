@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_8bit_storage : enable
+
+// Q8_0 dequantization shader
+// Q8_0 format: 32 8-bit weights with 1 fp16 scale
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { uint in_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+} params;
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= params.num_blocks) return;
+    
+    // Each Q8_0 block: 2 bytes scale + 32 bytes weights (32 x 8-bit)
+    uint block_offset = block_idx * 9;  // 34 bytes per block ≈ 9 uint32s
+    
+    // Read scale (first 2 bytes as fp16)
+    uint scale_bits = in_data[block_offset] & 0xFFFF;
+    float scale = unpackHalf2x16(scale_bits).x;
+    
+    // Read and dequantize 32 weights
+    uint out_offset = block_idx * 32;
+    
+    for (uint i = 0; i < 8; i++) {
+        uint packed = in_data[block_offset + 1 + i];
+        
+        for (uint j = 0; j < 4; j++) {
+            int byte_val = int((packed >> (j * 8)) & 0xFF);
+            if (byte_val > 127) byte_val -= 256;  // Sign extend
+            float weight = float(byte_val) * scale;
+            out_data[out_offset + i * 4 + j] = weight;
+        }
+    }
+}

@@ -1,0 +1,42 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// RMS normalization shader
+// output = x / sqrt(mean(x^2) + eps) * weight
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float in_data[]; };
+layout(set = 0, binding = 1) readonly buffer Weight { float weight[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint hidden_size;
+    float eps;
+} params;
+
+shared float shared_sq_sum;
+
+void main() {
+    uint batch = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint offset = batch * params.hidden_size;
+    
+    // Compute mean of squares
+    float local_sq_sum = 0.0;
+    for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {
+        float val = in_data[offset + i];
+        local_sq_sum += val * val;
+    }
+    atomicAdd(shared_sq_sum, local_sq_sum);
+    barrier();
+    
+    float rms = sqrt(shared_sq_sum / float(params.hidden_size) + params.eps);
+    float inv_rms = 1.0 / rms;
+    
+    // Normalize
+    for (uint i = tid; i < params.hidden_size; i += gl_WorkGroupSize.x) {
+        out_data[offset + i] = in_data[offset + i] * inv_rms * weight[i];
+    }
+}

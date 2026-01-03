@@ -1,0 +1,44 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// Sum reduction shader
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float in_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint input_size;
+    uint output_size;
+    uint reduce_size;  // Number of elements to reduce
+} params;
+
+shared float shared_data[256];
+
+void main() {
+    uint out_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint input_offset = out_idx * params.reduce_size;
+    
+    // Each thread sums multiple elements
+    float local_sum = 0.0;
+    for (uint i = tid; i < params.reduce_size; i += gl_WorkGroupSize.x) {
+        local_sum += in_data[input_offset + i];
+    }
+    
+    shared_data[tid] = local_sum;
+    barrier();
+    
+    // Tree reduction in shared memory
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_data[tid] += shared_data[tid + s];
+        }
+        barrier();
+    }
+    
+    if (tid == 0) {
+        out_data[out_idx] = shared_data[0];
+    }
+}

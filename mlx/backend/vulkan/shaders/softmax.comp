@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float in_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint seq_len;
+} params;
+
+shared float shared_max;
+shared float shared_sum;
+
+void main() {
+    uint batch = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint offset = batch * params.seq_len;
+    
+    // Step 1: Find max value
+    float local_max = -1e38;
+    for (uint i = tid; i < params.seq_len; i += gl_WorkGroupSize.x) {
+        local_max = max(local_max, in_data[offset + i]);
+    }
+    
+    // Reduce max within workgroup
+    atomicMax(shared_max, local_max);
+    barrier();
+    
+    float max_val = shared_max;
+    
+    // Step 2: Compute exp and sum
+    float local_sum = 0.0;
+    for (uint i = tid; i < params.seq_len; i += gl_WorkGroupSize.x) {
+        float exp_val = exp(in_data[offset + i] - max_val);
+        out_data[offset + i] = exp_val;
+        local_sum += exp_val;
+    }
+    
+    // Reduce sum within workgroup
+    atomicAdd(shared_sum, local_sum);
+    barrier();
+    
+    float sum_val = shared_sum;
+    
+    // Step 3: Normalize
+    for (uint i = tid; i < params.seq_len; i += gl_WorkGroupSize.x) {
+        out_data[offset + i] /= sum_val;
+    }
+}

@@ -1,0 +1,21 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// Arange shader - generates a sequence of numbers
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    float start;
+    float step;
+    uint size;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.size) return;
+    
+    out_data[idx] = params.start + float(idx) * params.step;
+}

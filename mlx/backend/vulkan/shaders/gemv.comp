@@ -1,0 +1,45 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// Matrix-vector multiplication: y = A * x
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer MatA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer VecX { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer VecY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;  // rows of A
+    uint N;  // cols of A
+} params;
+
+shared float shared_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (row >= params.M) return;
+    
+    // Each thread computes partial sum
+    float local_sum = 0.0;
+    for (uint col = tid; col < params.N; col += gl_WorkGroupSize.x) {
+        local_sum += A[row * params.N + col] * x[col];
+    }
+    
+    shared_sum[tid] = local_sum;
+    barrier();
+    
+    // Reduce within workgroup
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        barrier();
+    }
+    
+    if (tid == 0) {
+        y[row] = shared_sum[0];
+    }
+}

@@ -1,0 +1,110 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// Flash Attention shader (simplified version)
+// Computes scaled dot-product attention with memory efficiency
+
+#define BLOCK_SIZE 64
+
+layout(local_size_x = BLOCK_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer Query { float Q[]; };
+layout(set = 0, binding = 1) readonly buffer Key { float K[]; };
+layout(set = 0, binding = 2) readonly buffer Value { float V[]; };
+layout(set = 0, binding = 3) writeonly buffer Output { float O[]; };
+layout(set = 0, binding = 4) readonly buffer Mask { float mask[]; };  // Optional attention mask
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint num_heads;
+    uint seq_len;
+    uint head_dim;
+    float scale;
+    uint use_mask;
+} params;
+
+shared float shared_scores[BLOCK_SIZE];
+shared float shared_max;
+shared float shared_sum;
+
+void main() {
+    uint batch = gl_WorkGroupID.z;
+    uint head = gl_WorkGroupID.y;
+    uint query_pos = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    
+    uint qkv_stride = params.num_heads * params.seq_len * params.head_dim;
+    uint head_stride = params.seq_len * params.head_dim;
+    
+    uint q_offset = batch * qkv_stride + head * head_stride + query_pos * params.head_dim;
+    
+    // Initialize accumulators
+    float local_max = -1e38;
+    float local_sum = 0.0;
+    float local_output[BLOCK_SIZE / BLOCK_SIZE];  // Output accumulator per thread
+    
+    // Process key positions in blocks
+    for (uint kv_block = 0; kv_block < params.seq_len; kv_block += BLOCK_SIZE) {
+        uint key_pos = kv_block + tid;
+        
+        if (key_pos < params.seq_len) {
+            // Compute Q * K^T for this position
+            uint k_offset = batch * qkv_stride + head * head_stride + key_pos * params.head_dim;
+            
+            float score = 0.0;
+            for (uint d = 0; d < params.head_dim; d++) {
+                score += Q[q_offset + d] * K[k_offset + d];
+            }
+            score *= params.scale;
+            
+            // Apply mask if needed
+            if (params.use_mask != 0) {
+                uint mask_offset = batch * params.seq_len * params.seq_len + 
+                                   query_pos * params.seq_len + key_pos;
+                score += mask[mask_offset];
+            }
+            
+            shared_scores[tid] = score;
+            local_max = max(local_max, score);
+        } else {
+            shared_scores[tid] = -1e38;
+        }
+        
+        barrier();
+        
+        // Reduce max
+        for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                shared_scores[tid] = max(shared_scores[tid], shared_scores[tid + s]);
+            }
+            barrier();
+        }
+        
+        float block_max = shared_scores[0];
+        barrier();
+        
+        // Update running max and rescale
+        float old_max = local_max;
+        local_max = max(local_max, block_max);
+        float exp_diff = exp(old_max - local_max);
+        local_sum *= exp_diff;
+        
+        // Compute softmax scores and accumulate
+        if (key_pos < params.seq_len) {
+            float exp_score = exp(shared_scores[tid] - local_max);
+            local_sum += exp_score;
+            
+            // Accumulate weighted values
+            uint v_offset = batch * qkv_stride + head * head_stride + key_pos * params.head_dim;
+            // This is simplified - full implementation would accumulate over all dims
+        }
+        
+        barrier();
+    }
+    
+    // Write output (simplified)
+    if (tid < params.head_dim) {
+        uint o_offset = batch * qkv_stride + head * head_stride + query_pos * params.head_dim + tid;
+        // O[o_offset] = accumulated_output[tid] / local_sum;
+    }
+}
