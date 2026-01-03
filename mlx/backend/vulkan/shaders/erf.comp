@@ -1,0 +1,36 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float in_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint size;
+} params;
+
+// Error function approximation
+float erf_approx(float x) {
+    float a1 =  0.254829592;
+    float a2 = -0.284496736;
+    float a3 =  1.421413741;
+    float a4 = -1.453152027;
+    float a5 =  1.061405429;
+    float p  =  0.3275911;
+    
+    float sign_x = sign(x);
+    x = abs(x);
+    
+    float t = 1.0 / (1.0 + p * x);
+    float y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-x * x);
+    
+    return sign_x * y;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.size) return;
+    
+    out_data[idx] = erf_approx(in_data[idx]);
+}

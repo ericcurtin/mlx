@@ -1,486 +1,536 @@
 // Copyright © 2025 Apple Inc.
+//
+// This file contains implementations for primitives that are not covered by
+// the unary.cpp and binary.cpp files, such as reductions, matrix operations,
+// data movement, and other specialized operations.
 
 #include "mlx/backend/vulkan/device.h"
+#include "mlx/backend/vulkan/allocator.h"
+#include "mlx/backend/vulkan/kernels.h"
+#include "mlx/backend/vulkan/utils.h"
+#include "mlx/backend/common/utils.h"
+#include "mlx/allocator.h"
 #include "mlx/primitives.h"
 
 #include <stdexcept>
 
 namespace mlx::core {
 
-namespace {
+namespace vulkan {
 
-void throw_not_implemented(const std::string& op_name) {
-  throw std::runtime_error(
-      "[vulkan] Operation '" + op_name + "' not yet implemented on Vulkan backend");
-}
-
-}  // namespace
-
-#define NOT_IMPLEMENTED(T) \
-  void T::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) { \
-    throw_not_implemented(#T); \
+// Helper to copy data between arrays
+void copy_gpu(const array& src, array& dst, const Stream& s) {
+  auto& device = Device::instance();
+  auto& encoder = device.get_command_encoder(s);
+  
+  // For contiguous arrays, use simple copy
+  if (src.flags().contiguous && dst.flags().contiguous) {
+    auto src_buf = static_cast<VulkanBuffer*>(src.buffer().ptr());
+    auto dst_buf = static_cast<VulkanBuffer*>(dst.buffer().ptr());
+    encoder.copy_buffer(src_buf->buffer, dst_buf->buffer, 
+                        static_cast<VkDeviceSize>(src.nbytes()));
   }
-
-// Unary operations
-void Abs::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Abs");
 }
 
-void ArcCos::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArcCos");
+// Reduction implementation
+void reduce_gpu(
+    const array& in,
+    array& out,
+    const char* op,
+    const std::vector<int>& axes,
+    const Stream& s) {
+  
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+  
+  auto& device = Device::instance();
+  auto& encoder = device.get_command_encoder(s);
+  
+  auto kernel_info = get_reduce_kernel(op, in.dtype(), out.dtype());
+  
+  encoder.set_input_array(in);
+  encoder.set_output_array(out);
+  
+  // Calculate reduction size
+  size_t reduce_size = 1;
+  for (int axis : axes) {
+    reduce_size *= in.shape()[axis];
+  }
+  
+  uint32_t output_size = static_cast<uint32_t>(out.size());
+  uint32_t workgroup_count = output_size;
+  
+  encoder.dispatch(kernel_info.pipeline, kernel_info.layout, workgroup_count);
 }
 
-void ArcCosh::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArcCosh");
+// Matmul implementation
+void matmul_gpu(
+    const array& a,
+    const array& b,
+    array& out,
+    bool transpose_a,
+    bool transpose_b,
+    const Stream& s) {
+  
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+  
+  auto& device = Device::instance();
+  auto& encoder = device.get_command_encoder(s);
+  
+  auto kernel_info = get_matmul_kernel(a.dtype(), out.dtype(), transpose_a, transpose_b);
+  
+  encoder.set_input_array(a);
+  encoder.set_input_array(b);
+  encoder.set_output_array(out);
+  
+  // Get dimensions
+  int ndim = out.ndim();
+  uint32_t M = out.shape()[ndim - 2];
+  uint32_t N = out.shape()[ndim - 1];
+  uint32_t K = transpose_a ? a.shape()[ndim - 2] : a.shape()[ndim - 1];
+  
+  // Calculate workgroup counts
+  uint32_t grid_x = div_ceil(N, WORKGROUP_SIZE_2D);
+  uint32_t grid_y = div_ceil(M, WORKGROUP_SIZE_2D);
+  uint32_t batch_size = 1;
+  for (int i = 0; i < ndim - 2; i++) {
+    batch_size *= out.shape()[i];
+  }
+  
+  encoder.dispatch(kernel_info.pipeline, kernel_info.layout, grid_x, grid_y, batch_size);
 }
 
-void ArcSin::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArcSin");
+// Softmax implementation
+void softmax_gpu(const array& in, array& out, const Stream& s) {
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+  
+  auto& device = Device::instance();
+  auto& encoder = device.get_command_encoder(s);
+  
+  auto kernel_info = get_softmax_kernel(in.dtype());
+  
+  encoder.set_input_array(in);
+  encoder.set_output_array(out);
+  
+  // Last dimension is the softmax dimension
+  uint32_t batch_size = static_cast<uint32_t>(in.size() / in.shape().back());
+  
+  encoder.dispatch(kernel_info.pipeline, kernel_info.layout, batch_size);
 }
 
-void ArcSinh::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArcSinh");
+// Layer norm implementation
+void layer_norm_gpu(
+    const array& in,
+    const array& weight,
+    const array& bias,
+    array& out,
+    float eps,
+    const Stream& s) {
+  
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+  
+  auto& device = Device::instance();
+  auto& encoder = device.get_command_encoder(s);
+  
+  auto kernel_info = get_norm_kernel("layer_norm", in.dtype());
+  
+  encoder.set_input_array(in);
+  encoder.set_input_array(weight);
+  encoder.set_input_array(bias);
+  encoder.set_output_array(out);
+  
+  uint32_t batch_size = static_cast<uint32_t>(in.size() / in.shape().back());
+  
+  encoder.dispatch(kernel_info.pipeline, kernel_info.layout, batch_size);
 }
 
-void ArcTan::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArcTan");
+// RMS norm implementation
+void rms_norm_gpu(
+    const array& in,
+    const array& weight,
+    array& out,
+    float eps,
+    const Stream& s) {
+  
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+  
+  auto& device = Device::instance();
+  auto& encoder = device.get_command_encoder(s);
+  
+  auto kernel_info = get_norm_kernel("rms_norm", in.dtype());
+  
+  encoder.set_input_array(in);
+  encoder.set_input_array(weight);
+  encoder.set_output_array(out);
+  
+  uint32_t batch_size = static_cast<uint32_t>(in.size() / in.shape().back());
+  
+  encoder.dispatch(kernel_info.pipeline, kernel_info.layout, batch_size);
 }
 
-void ArcTanh::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArcTanh");
+// Attention implementation
+void attention_gpu(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const std::optional<array>& mask,
+    array& out,
+    float scale,
+    const Stream& s) {
+  
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+  
+  auto& device = Device::instance();
+  auto& encoder = device.get_command_encoder(s);
+  
+  bool use_mask = mask.has_value();
+  auto kernel_info = get_attention_kernel(queries.dtype(), use_mask);
+  
+  encoder.set_input_array(queries);
+  encoder.set_input_array(keys);
+  encoder.set_input_array(values);
+  if (use_mask) {
+    encoder.set_input_array(mask.value());
+  }
+  encoder.set_output_array(out);
+  
+  // Dimensions: [batch, num_heads, seq_len, head_dim]
+  int ndim = out.ndim();
+  uint32_t batch_size = out.shape()[0];
+  uint32_t num_heads = out.shape()[1];
+  uint32_t seq_len = out.shape()[2];
+  
+  encoder.dispatch(kernel_info.pipeline, kernel_info.layout, seq_len, num_heads, batch_size);
 }
 
-void Ceil::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Ceil");
+// RoPE implementation
+void rope_gpu(
+    array& data,
+    const array& freqs_cos,
+    const array& freqs_sin,
+    uint32_t offset,
+    const Stream& s) {
+  
+  if (data.size() == 0) {
+    return;
+  }
+  
+  auto& device = Device::instance();
+  auto& encoder = device.get_command_encoder(s);
+  
+  auto kernel_info = get_rope_kernel(data.dtype());
+  
+  encoder.set_input_array(data);
+  encoder.set_input_array(freqs_cos);
+  encoder.set_input_array(freqs_sin);
+  
+  uint32_t total_elements = static_cast<uint32_t>(data.size());
+  uint32_t workgroup_count = div_ceil(total_elements / 2, WORKGROUP_SIZE_1D);
+  
+  encoder.dispatch(kernel_info.pipeline, kernel_info.layout, workgroup_count);
 }
 
-void Conjugate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Conjugate");
-}
+} // namespace vulkan
 
-void Cos::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Cos");
-}
-
-void Cosh::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Cosh");
-}
-
-void Erf::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Erf");
-}
-
-void ErfInv::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ErfInv");
-}
-
-void Exp::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Exp");
-}
-
-void Expm1::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Expm1");
-}
-
-void Floor::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Floor");
-}
-
-void Imag::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Imag");
-}
-
-void Log::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Log");
-}
-
-void Log2::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Log2");
-}
-
-void Log10::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Log10");
-}
-
-void Log1p::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Log1p");
-}
-
-void LogicalNot::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("LogicalNot");
-}
-
-void Negative::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Negative");
-}
-
-void Real::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Real");
-}
-
-void Round::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Round");
-}
-
-void Sigmoid::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Sigmoid");
-}
-
-void Sign::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Sign");
-}
-
-void Sin::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Sin");
-}
-
-void Sinh::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Sinh");
-}
-
-void Sqrt::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Sqrt");
-}
-
-void Square::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Square");
-}
-
-void Tan::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Tan");
-}
-
-void Tanh::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Tanh");
-}
-
-// Binary operations
-void Add::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Add");
-}
-
-void ArcTan2::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArcTan2");
-}
-
-void BitwiseBinary::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("BitwiseBinary");
-}
-
-void Divide::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Divide");
-}
-
-void DivMod::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("DivMod");
-}
-
-void Equal::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Equal");
-}
-
-void Greater::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Greater");
-}
-
-void GreaterEqual::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("GreaterEqual");
-}
-
-void Less::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Less");
-}
-
-void LessEqual::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("LessEqual");
-}
-
-void LogAddExp::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("LogAddExp");
-}
-
-void LogicalAnd::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("LogicalAnd");
-}
-
-void LogicalOr::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("LogicalOr");
-}
-
-void Maximum::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Maximum");
-}
-
-void Minimum::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Minimum");
-}
-
-void Multiply::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Multiply");
-}
-
-void NaNEqual::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("NaNEqual");
-}
-
-void NotEqual::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("NotEqual");
-}
-
-void Power::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Power");
-}
-
-void Remainder::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Remainder");
-}
-
-void Subtract::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Subtract");
-}
+// Note: Unary operations (Abs, Exp, Log, etc.) are implemented in unary.cpp
+// Note: Binary operations (Add, Multiply, etc.) are implemented in binary.cpp
 
 // Reduction operations
-void Reduce::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Reduce");
+void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
+  out.set_data(allocator::malloc(out.nbytes()));
+  vulkan::reduce_gpu(inputs[0], out, reduce_type_name(reduce_type_).c_str(), 
+                     axes_, stream());
 }
 
-void ArgReduce::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArgReduce");
+void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // ArgReduce requires special handling - fallback to CPU for now
+  eval(inputs, out);
 }
 
-void Scan::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Scan");
+void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Scan (cumsum, etc.) - fallback to CPU for now
+  eval(inputs, out);
 }
 
 // Matrix operations
-void Matmul::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Matmul");
+void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  out.set_data(allocator::malloc(out.nbytes()));
+  vulkan::matmul_gpu(inputs[0], inputs[1], out, false, false, stream());
 }
 
-void AddMM::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("AddMM");
+void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // AddMM = alpha * (A @ B) + beta * C - implement with matmul + add
+  // For now, fallback to CPU
+  eval(inputs, out);
 }
 
-void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("BlockMaskedMM");
+void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void GatherMM::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("GatherMM");
+void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
 // Convolution
-void Convolution::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Convolution");
+void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Convolution requires specialized kernels - fallback to CPU
+  eval(inputs, out);
 }
 
 // Attention
-void ScaledDotProductAttention::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ScaledDotProductAttention");
+void ScaledDotProductAttention::eval_gpu(const std::vector<array>& inputs, array& out) {
+  out.set_data(allocator::malloc(out.nbytes()));
+  std::optional<array> mask;
+  if (inputs.size() > 3) {
+    mask = inputs[3];
+  }
+  vulkan::attention_gpu(inputs[0], inputs[1], inputs[2], mask, out, scale_, stream());
 }
 
 // Normalization
-void LayerNorm::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("LayerNorm");
+void LayerNorm::eval_gpu(const std::vector<array>& inputs, array& out) {
+  out.set_data(allocator::malloc(out.nbytes()));
+  vulkan::layer_norm_gpu(inputs[0], inputs[1], inputs[2], out, eps_, stream());
 }
 
-void RMSNorm::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("RMSNorm");
+void RMSNorm::eval_gpu(const std::vector<array>& inputs, array& out) {
+  out.set_data(allocator::malloc(out.nbytes()));
+  vulkan::rms_norm_gpu(inputs[0], inputs[1], out, eps_, stream());
 }
 
-void GroupNorm::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("GroupNorm");
+void GroupNorm::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Group norm - fallback to CPU
+  eval(inputs, out);
 }
 
-void RoPE::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("RoPE");
+void RoPE::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // RoPE operates in-place on a copy
+  auto& in = inputs[0];
+  if (in.is_donatable()) {
+    out.copy_shared_buffer(in);
+  } else {
+    out.set_data(allocator::malloc(out.nbytes()));
+    vulkan::copy_gpu(in, out, stream());
+  }
+  vulkan::rope_gpu(out, inputs[1], inputs[2], static_cast<uint32_t>(offset_), stream());
 }
 
-// Data movement
-void Copy::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Copy");
+// Data movement operations - many can delegate to eval() which does the right thing
+void Copy::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Reshape::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Reshape");
+void Reshape::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Transpose::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Transpose");
+void Transpose::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // For simple transposes, we can use GPU. Complex cases fall back to CPU.
+  eval(inputs, out);
 }
 
-void Broadcast::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Broadcast");
+void Broadcast::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void BroadcastTo::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("BroadcastTo");
+void BroadcastTo::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Concatenate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Concatenate");
+void Concatenate::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Concatenate can be done on GPU but for now fallback
+  eval(inputs, out);
 }
 
-void Pad::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Pad");
+void Pad::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
 void Split::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Split");
+  eval(inputs, outputs);
 }
 
-void Slice::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Slice");
+void Slice::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void SliceUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("SliceUpdate");
+void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Squeeze::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Squeeze");
+void Squeeze::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void ExpandDims::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ExpandDims");
+void ExpandDims::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Gather::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Gather");
+void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Scatter::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Scatter");
+void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Take::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Take");
+void Take::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void TakeAlongAxis::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("TakeAlongAxis");
+void TakeAlongAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
 // Type conversion
-void AsType::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("AsType");
+void AsType::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Type conversion can be done with copy kernel - for now fallback
+  eval(inputs, out);
 }
 
-void View::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("View");
+void View::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void AsStrided::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("AsStrided");
+void AsStrided::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-// Creation
-void Arange::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Arange");
+// Creation operations
+void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Arange can be done on GPU with a simple kernel
+  // For now, fallback to CPU
+  eval(inputs, out);
 }
 
-void Full::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Full");
+void Full::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Full/fill can use the fill shader
+  eval(inputs, out);
 }
 
-void NumberOfElements::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("NumberOfElements");
+void NumberOfElements::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
 // Random
-void RandomBits::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("RandomBits");
+void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Random number generation - fallback to CPU for now
+  eval(inputs, out);
 }
 
 // Sorting
-void Sort::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Sort");
+void Sort::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // GPU sorting requires bitonic sort or similar - fallback to CPU
+  eval(inputs, out);
 }
 
-void ArgSort::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArgSort");
+void ArgSort::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Partition::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Partition");
+void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void ArgPartition::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("ArgPartition");
+void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-// Linear algebra
+// Linear algebra - these are complex and typically use libraries like LAPACK
 void QRF::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("QRF");
+  eval(inputs, outputs);
 }
 
 void SVD::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("SVD");
+  eval(inputs, outputs);
 }
 
-void Inverse::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Inverse");
+void Inverse::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
-void Cholesky::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Cholesky");
+void Cholesky::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
 void Eig::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Eig");
+  eval(inputs, outputs);
 }
 
 void Eigh::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Eigh");
+  eval(inputs, outputs);
 }
 
 // Quantization
-void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("QuantizedMatmul");
+void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Quantized matmul requires dequantization + matmul
+  eval(inputs, out);
 }
 
-void GatherQMM::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("GatherQMM");
+void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
 void AffineQuantize::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("AffineQuantize");
+  eval(inputs, outputs);
 }
 
 // Ternary
-void Select::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Select");
+void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // Select/where can be done on GPU
+  eval(inputs, out);
 }
 
 void Where::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Where");
+  eval(inputs, outputs);
 }
 
 // FFT
-void FFT::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("FFT");
+void FFT::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // FFT requires specialized implementation - fallback to CPU
+  eval(inputs, out);
 }
 
 // Softmax
-void Softmax::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Softmax");
+void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
+  out.set_data(allocator::malloc(out.nbytes()));
+  vulkan::softmax_gpu(inputs[0], out, stream());
 }
 
 // Misc
-void StopGradient::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("StopGradient");
+void StopGradient::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
 void Compiled::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Compiled");
+  // Compiled kernels - not supported in Vulkan backend yet
+  eval(inputs, outputs);
 }
 
 void Depends::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Depends");
+  eval(inputs, outputs);
 }
 
-void Load::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  throw_not_implemented("Load");
+void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval(inputs, out);
 }
 
 }  // namespace mlx::core

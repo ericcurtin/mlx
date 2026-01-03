@@ -11,7 +11,10 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/allocator.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/kernels.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp)
 
 target_compile_definitions(mlx PRIVATE MLX_USE_VULKAN)
 
