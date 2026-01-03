@@ -4,6 +4,7 @@
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/utils.h"
 
+#include <mutex>
 #include <unordered_map>
 #include <stdexcept>
 
